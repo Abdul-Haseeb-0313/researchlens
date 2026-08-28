@@ -10,3 +10,7 @@ numpy
 sqlalchemy
 bcrypt
 python-jose[cryptography]
+cloudinary
+pinecone
+requests
+psycopg2-binary
