@@ -2,11 +2,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 pymupdf
-sentence-transformers
-faiss-cpu
 google-genai
 python-dotenv
-numpy
 sqlalchemy
 bcrypt
 python-jose[cryptography]

@@ -1,8 +1,7 @@
 from sentence_transformers import SentenceTransformer
 
 
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
-
+MODEL_NAME = "all-MiniLM-L6-v2"
 
 class EmbeddingModel:
     def __init__(self):

@@ -2,40 +2,66 @@ import re
 from typing import List, Dict, Any, Optional
 
 
-def _extract_citations(answer: str, max_source: int) -> List[int]:
-    pattern = r'\[(\d+)\]'
+def _extract_citation_numbers(answer: str, max_source: int) -> List[int]:
+    """
+    Extract all valid citation numbers from inline markers.
+    Handles single [1], multiple [2,3], and mixed [1, 4] forms.
+    Returns numbers in the order they appear.
+    """
+    pattern = r'\[([\d,\s]+)\]'
     matches = re.findall(pattern, answer)
     seen = set()
-    citations = []
+    numbers = []
     for match in matches:
-        num = int(match)
-        if 1 <= num <= max_source and num not in seen:
-            seen.add(num)
-            citations.append(num)
-    return citations
+        for part in match.split(','):
+            part = part.strip()
+            if part.isdigit():
+                num = int(part)
+                if 1 <= num <= max_source and num not in seen:
+                    seen.add(num)
+                    numbers.append(num)
+    return numbers
 
 
 def _clean_answer(answer: str, max_source: int) -> str:
-    """Remove citation markers that reference non-existent sources."""
+    """
+    Remove citation markers that reference non-existent sources.
+    Keep valid numbers (including comma-separated) and preserve formatting.
+    """
     def repl(match):
-        num = int(match.group(1))
-        return match.group(0) if 1 <= num <= max_source else ""
-    return re.sub(r'\[(\d+)\]', repl, answer)
+        content = match.group(1)
+        valid_parts = []
+        for part in content.split(','):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= max_source:
+                valid_parts.append(part)
+        if valid_parts:
+            # Keep original formatting: just join with comma+space
+            return "[" + ", ".join(valid_parts) + "]"
+        else:
+            return ""
+    return re.sub(r'\[([\d,\s]+)\]', repl, answer)
+
+
+def _strip_citation_list(answer: str) -> str:
+    """
+    Remove any trailing lines that start with [n] followed by a space.
+    Those are a separate sources list the model may have added.
+    """
+    lines = answer.strip().split("\n")
+    cleaned = []
+    for line in lines:
+        if re.match(r'^\s*\[\d+\]\s+', line):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 def _is_greeting(question: str) -> bool:
-    """Simple heuristic to detect greetings / small talk."""
-    greetings = {
-        "hi", "hello", "hey", "good morning", "good afternoon",
-        "good evening", "thanks", "thank you", "how are you",
-        "what's up", "whats up", "who are you", "what can you do",
-    }
+    greetings = {"hi", "hello", "hey", "good morning", "good afternoon",
+                 "thanks", "thank you", "how are you", "what's up", "whats up"}
     q = question.lower().strip().rstrip("?!. ")
-    # Check exact match or short sentence consisting solely of greeting words
-    words = q.split()
-    if len(words) <= 4 and any(g in q for g in greetings):
-        return True
-    return False
+    return any(g in q for g in greetings) and len(q.split()) <= 4
 
 
 def build_context(chunks: list[dict]) -> str:
@@ -51,11 +77,26 @@ def build_context(chunks: list[dict]) -> str:
     return ("\n\n" + ("\n\n" + "-" * 60 + "\n\n").join(sections))
 
 
+def _build_sources_block(cited_info: List[dict]) -> str:
+    """
+    Build a Sources: block from a list of {citation_number, chunk} dicts.
+    The citation_number is the actual number used inline.
+    """
+    if not cited_info:
+        return ""
+    lines = ["", "Sources:"]
+    for item in cited_info:
+        num = item["citation_number"]
+        src = item["chunk"]
+        doc = src.get("document_id", "Unknown")
+        page = src.get("page_start", "?")
+        lines.append(f"[{num}] {doc}, page {page}")
+    return "\n".join(lines)
+
+
 class RAGPipeline:
-    def __init__(self, embedder, vector_store, reranker, llm):
-        self.embedder = embedder
+    def __init__(self, vector_store, llm):
         self.vector_store = vector_store
-        self.reranker = reranker
         self.llm = llm
 
     def answer(
@@ -64,10 +105,8 @@ class RAGPipeline:
         retrieval_k: int = 10,
         final_k: int = 5,
         workspace_id: str = None,
-        reformulated_question: Optional[str] = None,
         history: Optional[List[dict]] = None,
     ) -> dict:
-        # Greeting / small talk → bypass retrieval
         if _is_greeting(question):
             return {
                 "answer": "Hello! I'm ResearchLens. Ask me anything about your uploaded documents and I'll provide cited answers.",
@@ -75,21 +114,11 @@ class RAGPipeline:
                 "cited_sources": [],
             }
 
-        retrieval_query = reformulated_question or question
-
-        # 1. Embed retrieval query
-        query_embedding = self.embedder.embed_text(retrieval_query)
-
-        # 2. Retrieve candidates
-        if workspace_id:
-            candidates = self.vector_store.search(
-                query_embedding,
-                workspace_id=workspace_id,
-                top_k=retrieval_k,
-            )
-        else:
-            candidates = self.vector_store.search(query_embedding, top_k=retrieval_k)
-
+        candidates = self.vector_store.search(
+            question,
+            workspace_id=workspace_id,
+            top_k=retrieval_k,
+        )
         if not candidates:
             return {
                 "answer": "I couldn't find any relevant information in the documents.",
@@ -97,35 +126,31 @@ class RAGPipeline:
                 "cited_sources": [],
             }
 
-        # 3. Rerank
-        reranked = self.reranker.rerank(retrieval_query, candidates, top_k=final_k)
+        final_chunks = candidates[:final_k]
+        max_src = len(final_chunks)
+        context = build_context(final_chunks)
 
-        # 4. Build context
-        context = build_context(reranked)
-
-        # 5. Conversation history
         history_str = ""
         if history:
-            history_parts = []
+            parts = []
             for msg in history:
                 role = "User" if msg["role"] == "user" else "Assistant"
-                history_parts.append(f"{role}: {msg['content']}")
-            history_str = "\n".join(history_parts[-6:])
+                parts.append(f"{role}: {msg['content']}")
+            history_str = "\n".join(parts[-6:])
 
-        # 6. Prompt
         prompt = f"""
 You are ResearchLens, an evidence‑grounded research assistant.
 
 Answer the user's question using ONLY the provided evidence and conversation history.
 
 STRICT RULES:
-1. Cite your sources inline using square brackets with the source number, e.g. [1] or [2].
-2. Only cite sources that actually support the statement.
-3. You may cite multiple sources in one sentence if needed, like [1][2].
-4. Do NOT invent any facts or sources.
-5. If the evidence is insufficient, say: "I couldn't find enough evidence in the uploaded documents."
-6. Be concise but informative.
-7. The source numbers correspond to the SOURCE numbers in the evidence below.
+1. There are exactly {max_src} sources available, numbered 1 to {max_src}.
+2. Use inline citations ONLY, like [1] or [2] immediately after the relevant sentence.
+3. You may cite multiple sources in one bracket, e.g. [1,3].
+4. Never cite a source number greater than {max_src}.
+5. Do NOT include a separate "Sources" section at the end.
+6. Do not list sources as [1] DocumentName · p.X at the bottom.
+7. If evidence is insufficient, say: "I couldn't find enough evidence in the uploaded documents."
 
 CONVERSATION HISTORY:
 {history_str if history_str else "None"}
@@ -138,22 +163,42 @@ USER QUESTION:
 
 {question}
 
-ANSWER (with citations):
+ANSWER (with inline citations only):
 """
 
-        # 7. Generate answer
         raw_answer = self.llm.generate(prompt)
+        answer = _clean_answer(raw_answer, max_src)
+        answer = _strip_citation_list(answer)
 
-        # 8. Sanitize citations
-        max_src = len(reranked)
-        clean_answer = _clean_answer(raw_answer, max_src)
+        # Extract citation numbers (order preserved)
+        cited_numbers = _extract_citation_numbers(answer, max_src)
 
-        # 9. Extract cited sources
-        cited_numbers = _extract_citations(clean_answer, max_source=max_src)
-        cited_sources = [reranked[i - 1] for i in cited_numbers]
+        # Build cited_info list: unique numbers with their chunk
+        cited_info = []
+        seen = set()
+        for num in cited_numbers:
+            if num in seen:
+                continue
+            seen.add(num)
+            chunk = final_chunks[num - 1]
+            cited_info.append({
+                "citation_number": num,
+                "chunk": chunk,
+            })
+
+        # Build the sources block
+        sources_block = _build_sources_block(cited_info)
+        if sources_block:
+            answer = answer + "\n" + sources_block
+
+        # Prepare cited_sources for API response (with citation_number)
+        cited_sources = [
+            {**item["chunk"], "citation_number": item["citation_number"]}
+            for item in cited_info
+        ]
 
         return {
-            "answer": clean_answer,
-            "sources": reranked,
+            "answer": answer,
+            "sources": final_chunks,
             "cited_sources": cited_sources,
         }

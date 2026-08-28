@@ -6,14 +6,12 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
-import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from cloudinary.utils import cloudinary_url
@@ -23,9 +21,7 @@ from database import engine, SessionLocal
 from app.ingestion.pdf_loader import load_pdf
 from app.ingestion.cleaner import clean_text
 from app.ingestion.chunker import create_chunks
-from app.retrieval.embeddings import EmbeddingModel
 from app.retrieval.pinecone_store import PineconeVectorStore
-from app.retrieval.reranker import Reranker
 from app.generation.llm import GeminiLLM
 from app.services.rag import RAGPipeline
 from app.storage.cloudinary_storage import upload_pdf as cloudinary_upload, delete_pdf
@@ -38,9 +34,7 @@ TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
-# Global models (lazy)
-embedder = None
-reranker = None
+# Global Gemini LLM instance (no heavy models)
 llm = None
 
 app = FastAPI(title="ResearchLens API")
@@ -71,21 +65,17 @@ class AskResponse(BaseModel):
     sources: List[dict]
     cited_sources: List[dict]
 
-# ---------- Helper functions ----------
-def get_models():
-    global embedder, reranker, llm
-    if embedder is None:
-        embedder = EmbeddingModel()
-    if reranker is None:
-        reranker = Reranker()
+# ---------- Helper ----------
+def get_llm():
+    global llm
     if llm is None:
         llm = GeminiLLM()
-    return embedder, reranker, llm
+    return llm
 
 def reformulate_query(question: str, history: List[dict]) -> str:
     if not history:
         return question
-    llm = get_models()[2]
+    llm_instance = get_llm()
     history_str = "\n".join(
         [f"{'User' if msg['role']=='user' else 'Assistant'}: {msg['content']}" for msg in history[-6:]]
     )
@@ -99,7 +89,7 @@ Latest Question: {question}
 
 Standalone Question:
 """
-    reformulated = llm.generate(prompt).strip()
+    reformulated = llm_instance.generate(prompt).strip()
     return reformulated or question
 
 # ---------- Health endpoint ----------
@@ -148,16 +138,11 @@ async def read_current_user(current_user: models.User = Depends(auth.get_current
 # ---------- Workspace endpoints ----------
 @app.post("/workspaces", status_code=201)
 async def create_workspace(
-    request: Request,
     name: str = Form(...),
     files: List[UploadFile] = File(None),
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(database.get_db)
 ):
-    # Check for disconnect before heavy work
-    if request.is_disconnected():
-        return JSONResponse(status_code=499, content={"detail": "Client disconnected"})
-
     # Create workspace
     new_ws = models.Workspace(name=name, user_id=current_user.id)
     db.add(new_ws)
@@ -179,10 +164,8 @@ async def create_workspace(
                 temp_files.append((tmp_path, file.filename))
 
             if temp_files:
-                # Upload to Cloudinary
+                # Upload to Cloudinary and create Document records
                 for tmp_path, original_filename in temp_files:
-                    if request.is_disconnected():
-                        raise HTTPException(499, "Client disconnected")
                     public_id = f"user_{current_user.id}/workspace_{new_ws.id}/{uuid.uuid4()}_{original_filename}"
                     try:
                         cloud_response = cloudinary_upload(tmp_path, public_id)
@@ -201,17 +184,16 @@ async def create_workspace(
                     db.add(doc)
                 db.commit()
 
-                # Process PDFs
+                # Process PDFs -> chunks
                 all_chunks = []
                 document_urls = {}
                 for tmp_path, original_filename in temp_files:
-                    if request.is_disconnected():
-                        raise HTTPException(499, "Client disconnected")
                     doc_id = os.path.splitext(original_filename)[0]
                     raw_pages = load_pdf(tmp_path)
                     cleaned_pages = [{"page": p["page"], "text": clean_text(p["text"])} for p in raw_pages]
                     chunks = create_chunks(cleaned_pages, document_id=doc_id)
                     all_chunks.extend(chunks)
+
                     doc_record = db.query(models.Document).filter(
                         models.Document.workspace_id == new_ws.id,
                         models.Document.filename == original_filename
@@ -219,12 +201,11 @@ async def create_workspace(
                     if doc_record:
                         document_urls[doc_id] = doc_record.cloudinary_url
 
+                # Store in Pinecone (no local embedding needed)
                 if all_chunks:
-                    embedder, _, _ = get_models()
-                    embedded_chunks = embedder.embed_chunks(all_chunks)
                     pinecone_store = PineconeVectorStore()
                     pinecone_store.add_chunks(
-                        embedded_chunks,
+                        all_chunks,
                         workspace_id=new_ws.id,
                         user_id=current_user.id,
                         document_urls=document_urls,
@@ -340,25 +321,32 @@ async def ask_in_workspace(
     ).first()
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found or not owned by user")
+
+    # Fetch history
     messages = db.query(models.Message).filter(
         models.Message.workspace_id == workspace_id
     ).order_by(models.Message.created_at.desc()).limit(10).all()
     history = [{"role": msg.role, "content": msg.content} for msg in reversed(messages)]
+
+    # Save user message
     user_msg = models.Message(workspace_id=workspace_id, role="user", content=request.question)
     db.add(user_msg)
     db.commit()
-    embedder, reranker, llm = get_models()
+
+    llm_instance = get_llm()
     reformulated = reformulate_query(request.question, history)
+
     pinecone_store = PineconeVectorStore()
-    rag = RAGPipeline(embedder, pinecone_store, reranker, llm)
+    rag = RAGPipeline(pinecone_store, llm_instance)
+
     result = rag.answer(
-        question=request.question,
+        question=reformulated,
         retrieval_k=10,
         final_k=5,
         workspace_id=workspace_id,
-        reformulated_question=reformulated,
         history=history,
     )
+
     assistant_msg = models.Message(
         workspace_id=workspace_id,
         role="assistant",
@@ -367,6 +355,8 @@ async def ask_in_workspace(
     )
     db.add(assistant_msg)
     db.commit()
+
     for i, src in enumerate(result["cited_sources"], start=1):
         src["citation_number"] = i
+
     return result
